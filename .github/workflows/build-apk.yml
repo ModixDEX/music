@@ -1,0 +1,186 @@
+# Managed by GitHub Android Builder v1.0
+name: Android APK Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'GitHub Release Tag containing project.zip'
+        required: false
+        default: ''
+      build_variant:
+        description: 'Build Variant (debug or release)'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+      clean_source:
+        description: 'Remove uploaded project.zip from release after build'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  prepare:
+    name: Prepare Source Archive
+    runs-on: ubuntu-latest
+    outputs:
+      has_source_archive: ${{ steps.check_source.outputs.has_source }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download Project Archive from Release
+        id: check_source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Checking for project archive in release: ${{ github.event.inputs.release_tag }}"
+          if [ -n "${{ github.event.inputs.release_tag }}" ]; then
+            gh release download "${{ github.event.inputs.release_tag }}" -p "project.zip" --clobber || true
+          fi
+          
+          if [ -f "project.zip" ]; then
+            echo "has_source=true" >> $GITHUB_OUTPUT
+            echo "Successfully retrieved project.zip"
+          else
+            echo "has_source=false" >> $GITHUB_OUTPUT
+            echo "No project.zip found in release; using repository branch source"
+          fi
+
+      - name: Upload Temporary Source Artifact
+        if: steps.check_source.outputs.has_source == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-source
+          path: project.zip
+          retention-days: 1
+
+  build:
+    name: Build Android APK
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Source Code
+        if: needs.prepare.outputs.has_source_archive != 'true'
+        uses: actions/checkout@v4
+
+      - name: Download Project Source Artifact
+        if: needs.prepare.outputs.has_source_archive == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: project-source
+
+      - name: Unpack Project
+        if: needs.prepare.outputs.has_source_archive == 'true'
+        run: |
+          mkdir -p extracted_source
+          unzip -q project.zip -d extracted_source
+          # If extracted archive contains single wrapping root folder, move contents up
+          SUBDIRS=(extracted_source/*)
+          if [ ${#SUBDIRS[@]} -eq 1 ] && [ -d "${SUBDIRS[0]}" ]; then
+            cp -r "${SUBDIRS[0]}"/* .
+          else
+            cp -r extracted_source/* .
+          fi
+          rm -rf extracted_source project.zip
+
+      - name: Set up Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android SDK Licenses & Install Components
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "platforms;android-34" "platform-tools" || true
+
+      - name: Ensure Gradle Wrapper Executable
+        run: |
+          if [ ! -f "gradlew" ]; then
+            echo "gradlew not found. Initializing Gradle wrapper..."
+            gradle wrapper --gradle-version 8.5
+          fi
+          chmod +x gradlew
+
+      - name: Run Android Build
+        id: build_step
+        run: |
+          mkdir -p build-result
+          VARIANT="${{ github.event.inputs.build_variant }}"
+          TASK_NAME="assembleDebug"
+          if [ "$VARIANT" = "release" ]; then
+            TASK_NAME="assembleRelease"
+          fi
+          
+          echo "Executing: ./gradlew $TASK_NAME --stacktrace" | tee build-result/build.log
+          ./gradlew $TASK_NAME --stacktrace 2>&1 | tee -a build-result/build.log
+
+      - name: Collect Generated APK Artifacts
+        if: always()
+        run: |
+          mkdir -p build-result
+          echo "Collecting APK files..."
+          find . -name "*.apk" ! -path "*/intermediates/*" ! -path "*/unaligned/*" -exec cp {} build-result/ \;
+          ls -la build-result/
+
+      - name: Upload Build Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-result
+          path: build-result/
+          retention-days: 14
+
+  publish:
+    name: Publish APK to GitHub Release
+    needs: [prepare, build]
+    if: always() && github.event.inputs.release_tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Build Results
+        uses: actions/download-artifact@v4
+        with:
+          name: build-result
+          path: build-result
+
+      - name: Upload APKs to Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.release_tag }}"
+          echo "Attaching build artifacts to release: $TAG"
+          for file in build-result/*.apk; do
+            if [ -f "$file" ]; then
+              gh release upload "$TAG" "$file" --clobber || true
+            fi
+          done
+          if [ -f "build-result/build.log" ]; then
+            gh release upload "$TAG" "build-result/build.log" --clobber || true
+          fi
+
+      - name: Cleanup Temporary project.zip Asset
+        if: github.event.inputs.clean_source == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.release_tag }}"
+          echo "Cleaning up temporary project.zip from release $TAG"
+          gh release delete-asset "$TAG" "project.zip" -y || true
